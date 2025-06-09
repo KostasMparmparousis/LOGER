@@ -1,13 +1,3 @@
-## Setup Environment
-1. Install [Miniconda](https://docs.conda.io/en/latest/miniconda.html) if not already installed.
-2. Create and activate the environment:
-   ```bash
-   conda env create -f environment.yml
-   conda activate loger
-   ```
-
----
-
 # LOGER: A Learned Optimizer towards Generating Efficient and Robust Query Execution Plans
 
 ## Requirements
