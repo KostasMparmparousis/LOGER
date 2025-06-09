@@ -6,6 +6,31 @@
    conda activate loger
    ```
 
+## Training Guide
+
+1. Configure the model checkpoint path in `train.py` (line 313):
+   ```python
+   model_dir = "/your/path/here"  # Update this path to save your checkpoint
+   ```
+
+2. Run the training script:
+   ```bash
+   python3 train.py
+   ```
+
+## Testing guide
+
+1. Configure the model checkpoint path in `test_loaded_checkpoint.py` (line 20):
+   ```python
+   MODEL_DIR = "/your/path/here"  # Update this path to load your checkpoint
+   ```
+
+2. Run the testing script:
+   ```bash
+   python3 test_loaded_checkpoint.py \
+       /path/to/workload/experiment1/job/run1/ \
+   ```
+
 ---
 
 # LOGER: A Learned Optimizer towards Generating Efficient and Robust Query Execution Plans
