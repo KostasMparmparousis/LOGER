@@ -17,10 +17,13 @@ import pickle
 from lib.log import Logger
 from lib.timer import timer
 from lib.cache import HashCache
-
+import time
 from core import database, Sql, Plan, load
 from model.dqn import DeepQNet
 from model import explorer
+from datetime import datetime
+import json
+import shutil
 
 from core.oracle import oracle_database
 USE_ORACLE = False
@@ -301,9 +304,72 @@ def database_warmup(train_set, k=400):
         gen.set_postfix({'file': sql.filename})
         database.latency(str(sql), cache=False)
 
+def save_training_artifacts(epoch, model, baseline_manager, baseline_explorer, 
+                           sample_weights, train_rcs, database, global_df, 
+                           timer_df, total_time, random_state, args_dict,
+                           is_final=False):
+    """Save complete training artifacts to central directory"""
+    # Configuration
+    model_dir = "/data/hdd1/users/kmparmp/models/loger/job-added-index"
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    run_dir = os.path.join(model_dir, f"run_{FILE_ID}")
+    os.makedirs(run_dir, exist_ok=True)
+    
+    # 1. Save model checkpoint with all original fields
+    artifact_name = f"final_{FILE_ID}" if is_final else f"epoch{epoch}_{FILE_ID}"
+    model_path = os.path.join(run_dir, f"{timestamp}_{artifact_name}.pkl")
+    
+    torch.save({
+        'model': model.model_export(),
+        'epoch': epoch,
+        'baseline': baseline_manager.state_dict(),
+        'sample_weights': sample_weights,
+        'train_rcs': train_rcs,
+        'baseline_count': baseline_explorer.count,
+        'timeout_limit': database.statement_timeout,
+        'global_df': global_df,
+        'timer_df': timer_df,
+        'total_time': total_time,
+        'random_state': random_state,
+        'args': args_dict,
+    }, model_path, _use_new_zipfile_serialization=False)
+    
+    baseline_path = os.path.join(run_dir, f"{timestamp}_{artifact_name}_baseline.pkl")
+    with open(baseline_path, 'wb') as f:
+        pickle.dump(baseline_manager.data, f)
+    
+    results_dir = os.path.join(run_dir, "results")
+    if is_final and os.path.exists("results"):
+        shutil.copytree("results", results_dir, dirs_exist_ok=True)
+    
+    metadata = {
+        'timestamp': timestamp,
+        'file_id': FILE_ID,
+        'epoch': epoch,
+        'total_training_time': total_time,
+        'baseline_stats': {
+            'count': len(baseline_manager.data),
+            'gmrl': np.exp(np.mean(np.log(
+                [x[0] for x in baseline_manager.data.values()]
+            ))) if baseline_manager.data else 0
+        },
+        'paths': {
+            'model': os.path.basename(model_path),
+            'baseline': os.path.basename(baseline_path),
+            'results': 'results/'
+        }
+    }
+
+    metadata_path = os.path.join(run_dir, f"{timestamp}_{artifact_name}_metadata.json")
+    with open(metadata_path, 'w') as f:
+        json.dump(metadata, f, indent=2)
+    
+    print(f"Saved complete artifacts for {artifact_name} to {run_dir}")
+
 def train(beam_width=1, epochs=400):
     checkpoint_file = f'temps/{FILE_ID}.checkpoint.pkl'
     baseline_explorer = explorer.HalfTimeExplorer(0.5, 0.2, 80)
+
     if os.path.isfile(checkpoint_file):
         dic = torch.load(checkpoint_file, map_location=device)
         model.model_recover(dic['model'])
@@ -378,6 +444,7 @@ def train(beam_width=1, epochs=400):
     use_beam = beam_width >= 1
 
     for epoch in range(start_epoch, epochs):
+        epoch_start_time = time.time()
         with _total_train_timer:
             if False and epoch >= 100 and epoch % 25 == 0:
                 model.explorer.reset()
@@ -638,6 +705,14 @@ def train(beam_width=1, epochs=400):
             'random_state': random_state,
             'args': args_dict,
         }, checkpoint_file, _use_new_zipfile_serialization=False)
+        
+        # Save artifacts after validation
+        save_training_artifacts(
+            epoch, model, baseline_manager, baseline_explorer,
+            sample_weights, train_rcs, database, global_df,
+            timer_df, total_training_time, random_state, args_dict
+        )
+        
     with open(f'baseline.pkl', 'wb') as f:
         pickle.dump(baseline_manager.data, f)
 
@@ -656,6 +731,13 @@ def train(beam_width=1, epochs=400):
         'args': args_dict,
     }, f'pretrained/step{FILE_ID}.pkl', _use_new_zipfile_serialization=False)
 
+    # Final save at end of training
+    save_training_artifacts(
+        epochs-1, model, baseline_manager, baseline_explorer,
+        sample_weights, train_rcs, database, global_df,
+        timer_df, total_training_time, random_state, args_dict,
+        is_final=True
+    )
 
 if __name__ == '__main__':
     import argparse
@@ -663,7 +745,7 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument('-d', '--dataset', nargs=2, type=str, default=['dataset/train', 'dataset/test'],
                         help='Training and testing dataset.')
-    parser.add_argument('-e', '--epochs', type=int, default=200,
+    parser.add_argument('-e', '--epochs', type=int, default=50,
                         help='Total epochs.')
     parser.add_argument('-F', '--id', type=str, default=FILE_ID,
                         help='File ID.')
@@ -695,14 +777,16 @@ if __name__ == '__main__':
                         help='Pretrained checkpoint.')
     parser.add_argument('-S', '--seed', type=int, default=3407,
                         help='Random seed.')
-    parser.add_argument('-D', '--database', type=str, default='imdb',
-                        help='PostgreSQL database.')
-    parser.add_argument('-U', '--user', type=str, default='postgres',
+    parser.add_argument('-D', '--database', type=str, default='imdbload',
+                        help='PostgreSQL database.')    
+    parser.add_argument('-U', '--user', type=str, default='suite_user',
                         help='PostgreSQL user.')
-    parser.add_argument('-P', '--password', type=str, default=None,
+    parser.add_argument('-P', '--password', type=str, default='71Vgfi4mUNPm',
                         help='PostgreSQL user password.')
-    parser.add_argument('--port', type=int, default=None,
+    parser.add_argument('--port', type=int, default=5469,
                         help='PostgreSQL port.')
+    parser.add_argument('-H', '--host', type=str, default='train.darelab.athenarc.gr', 
+                        help='PostgreSQL host.')
 
     args = parser.parse_args()
 
@@ -740,6 +824,8 @@ if __name__ == '__main__':
                 database_args['password'] = args.password
             if args.port is not None:
                 database_args['port'] = args.port
+            if args.host is not None:
+                database_args['host'] = args.host                
             database.setup(**database_args, cache=False)
         except:
             database.assistant_setup(dbname=args.database, cache=False)

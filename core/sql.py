@@ -291,10 +291,33 @@ class _global:
             if cached is not None:
                 return cached
 
+        self.__cur.execute(f"SET statement_timeout = 600000;")
         self.__cur.execute("EXPLAIN (ANALYZE, FORMAT JSON) " + sql)
         rows = self.__cur.fetchall()
         self.__plan_latency_cache[sql] = rows
         self.__auto_save()
+
+        return rows
+
+    def plan_latency_alt(self, sql, cache=True):
+        self.__pre_settings()
+        sql = sql + ";"
+
+        if cache:
+            cached = self.__plan_latency_cache.get(sql, None)
+            if cached is not None:
+                return cached
+        try:
+            print(sql)
+            # Set the statement timeout to 10 minutes
+            self.__cur.execute(f"SET statement_timeout = 600000;")
+            self.__cur.execute("EXPLAIN (ANALYZE, FORMAT JSON) " + sql)
+            rows = self.__cur.fetchall()
+            self.__plan_latency_cache[sql] = rows
+            self.__auto_save()
+        except:
+            print(sql)
+            raise
 
         return rows
 
@@ -366,7 +389,15 @@ class _global:
 
         self.__latency_cache[latency] = latency
         self.__auto_save()
+        self.__clear_cache()
         return latency
+    
+    def __clear_cache(self):
+        assert self.__db is not None
+        # Use the clear_cache function we have defined in the postgres environment to clear the cache
+        # We basically just need to execute a pg query SELECT clear_cache();
+        self.__cur.execute("SELECT \"clear_cache\"();")
+        
 
     def __timeout_limit(self, sql):
         assert self.__db is not None

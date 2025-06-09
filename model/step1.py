@@ -293,7 +293,7 @@ class PredictTail(torch.nn.Module):
         res = self.prev_tail(torch.cat([res, matrix], dim=-1))
         return res
 
-    def forward(self, g, extra, parent_emb, left_emb, right_emb, joins):
+    def forward(self, g, extra, parent_emb, left_emb, right_emb, joins, return_embedding=False):
         parent_emb = torch.cat([parent_emb, left_emb, right_emb], dim=-1)
         if parent_emb.dim() == 1:
             parent_emb = parent_emb.unsqueeze(0)
@@ -303,8 +303,14 @@ class PredictTail(torch.nn.Module):
 
         matrix = (self.join_matrix_embeddings * joins.view(*joins.shape[:-1], 1, joins.shape[-1])).sum(dim=-1, keepdim=False) / extra
         res = torch.cat([res, matrix], dim=-1)
+
         if res.dim() == 1:
             res = res.unsqueeze(0).repeat(parent_emb.shape[0], 1)
+
+        if return_embedding:
+            embeddings = torch.cat([res, parent_emb], dim=-1)
+            return res, embeddings
+
         res = self.tail(torch.cat([res, parent_emb], dim=-1))
         return res
 

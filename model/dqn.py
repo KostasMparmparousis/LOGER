@@ -149,7 +149,6 @@ class DeepQNet:
         all_candidates = []
         all_res = []
         exploration_mask = []
-
         for state_index, state in enumerate(states):
             if isinstance(state, tuple):
                 state, is_explore = state
@@ -271,6 +270,7 @@ class DeepQNet:
                 Plan.HASH_JOIN if join == 1 else \
                 Plan.MERGE_JOIN if join == 2 else \
                 Plan.NEST_LOOP_JOIN
+        # join_method = Plan.NEST_LOOP_JOIN
         parent_alias = state.join(left_alias, right_alias, join_method=join_method)
 
         left_emb, right_emb = state.root_node_emb(left_alias), state.root_node_emb(right_alias)
@@ -278,24 +278,75 @@ class DeepQNet:
         state.root_node_emb_set(parent_alias, parent_emb)
         return state
 
-    def beam_plan(self, sql : Sql, bushy=False, judge=False):
+    def beam_plan(self, sql: Sql, bushy=False, judge=False, return_prediction=False, return_embedding=False):
         plan, graph = self.init(sql, grad=False, return_graph=True)
         plans = [plan]
         beam_width = database.config.beam_width
         use_beam = beam_width >= 1
         if not use_beam:
             beam_width = 1
+        selected = []
+        current_step_embeddings = []
+        
         while not plans[0].completed:
-            selected = self.topk_search(plans, beam_width, exploration=False, use_beam=use_beam, bushy=bushy)
+            if return_prediction:
+                selected, explore, selected_items, all_res_stats, prob = self.topk_search(plans, beam_width, exploration=False, detail=True, use_beam=use_beam, bushy=bushy)
+            else:
+                selected = self.topk_search(plans, beam_width, exploration=False, use_beam=use_beam, bushy=bushy)
             plans = []
+
             for (_, plan, action), join in selected:
                 plan = plan.clone(deep=True)
                 self.step(plan, action, join=join)
                 plans.append(plan)
+                
+                if return_embedding:
+                    # Compute embedding for this join (like in train())
+                    global_emb = plan.root_node_emb_all_hidden()
+                    _len = len(plan.sql.from_tables)
+                    global_emb = self.model_tail.aggregate(global_emb)
+                    state_join_encodings = plan.join_encodings()
+                    
+                    left_emb = plan.root_node_emb(action[0])
+                    right_emb = plan.root_node_emb(action[1])
+                    
+                    parent_emb = self.model_step2(left_emb, right_emb, input=None)
+                    parent_emb = parent_emb.chunk(2, dim=-1)[0]
+                    left_emb = left_emb.chunk(2, dim=-1)[0]
+                    right_emb = right_emb.chunk(2, dim=-1)[0]
+                    
+                    # Get the embedding via PredictTail (matching train() logic)
+                    _, embedding = self.model_tail(
+                        global_emb.unsqueeze(0),  # Add batch dim
+                        torch.tensor([_len], device=self.device),
+                        parent_emb.unsqueeze(0),
+                        left_emb.unsqueeze(0),
+                        right_emb.unsqueeze(0),
+                        state_join_encodings.unsqueeze(0),
+                        return_embedding=True
+                    )
+                    current_step_embeddings.append(embedding.squeeze(0))  # Remove batch dim
+
+        if return_embedding:
+            plan_embeddings = current_step_embeddings  # Track latest beam's embeddings
+
         plan = plans[0]
         _timer = timer()
         with _timer:
             use_generated = False
+
+        # Return the final embedding
+        final_embedding = None
+        if return_embedding:
+            final_embedding = plan_embeddings[0]
+        
+        if return_prediction:
+            predicted_latency = all_res_stats[0]
+            if return_embedding:
+                return plan, use_generated, _timer.time, predicted_latency, final_embedding
+            return plan, use_generated, _timer.time, predicted_latency
+        if return_embedding:
+            return plan, use_generated, _timer.time, final_embedding
         return plan, use_generated, _timer.time
 
     def clear_baseline_dict(self, sql):
@@ -475,3 +526,4 @@ class DeepQNet:
 
     def schedule(self, epoch=None):
         self.sched.step(epoch)
+        
