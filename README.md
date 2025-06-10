@@ -28,7 +28,7 @@
 2. Run the testing script:
    ```bash
    python3 test_loaded_checkpoint.py \
-       /path/to/workload/experiment1/job/run1/ \
+       /path/to/workload/experiment1/job/run1/
    ```
 
 ---
