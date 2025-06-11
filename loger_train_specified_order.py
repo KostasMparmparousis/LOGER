@@ -368,8 +368,8 @@ def save_training_artifacts(epoch, model, baseline_manager, baseline_explorer,
 def train(beam_width=1, epochs=400, parent_dir='.', args=None):
     checkpoint_file = f'temps/{FILE_ID}.checkpoint.pkl'
     baseline_explorer = explorer.HalfTimeExplorer(0.5, 0.2, 80)
-    model_dir = Path(parent_dir).parent.joinpath("models/loger/asc_complexity/checkpoints")
-    final_dir = Path(parent_dir).parent.joinpath("models/loger/asc_complexity/final_model")
+    model_dir = Path("../../models/experiment5/5.1/complexity_generalization/LOGER/checkpoints")
+    final_dir = Path("../../models/experiment5/5.1/complexity_generalization/LOGER/final_model")
 
     # Create directories if they don't exist (with parents as needed)
     model_dir.mkdir(parents=True, exist_ok=True)
