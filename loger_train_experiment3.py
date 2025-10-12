@@ -351,14 +351,22 @@ def load_checkpoint():
 def save_training_artifacts(epoch, model, baseline_manager, baseline_explorer, 
                            sample_weights, train_rcs, database, global_df, 
                            timer_df, total_time, random_state, args_dict, model_dir,
-                           avg_loss, avg_use_gen_loss, is_final=False):
-    """Save complete training artifacts to central directory"""
-    # Configuration
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                           avg_loss, avg_use_gen_loss, total_queries_seen, is_final=False, checkpoint_reason=""):
+    """Save complete training artifacts to central directory with standardized naming."""
+    
+    ### MODIFICATION: Standardize the artifact naming convention ###
+    # Create a detailed, standardized name for the checkpoint files.
+    # This matches the convention used by BAO, LERO, and NEO.
+    if is_final:
+        prefix = f"final-epoch-{epoch:03d}_queries-{total_queries_seen}_loss-{avg_loss:.6f}_reason-{checkpoint_reason}"
+    else:
+        prefix = f"epoch-{epoch:03d}_queries-{total_queries_seen}_loss-{avg_loss:.6f}_reason-{checkpoint_reason}"
+
+    # The final unique name for this set of artifacts
+    artifact_name = f"{prefix}_{args_dict['id']}" # e.g., epoch-010_..._loger_job_exp3
     
     # 1. Save model checkpoint with all original fields
-    artifact_name = f"final_{FILE_ID}" if is_final else f"epoch{epoch}_{FILE_ID}"
-    model_path = os.path.join(model_dir, f"{timestamp}_{artifact_name}.pkl")
+    model_path = os.path.join(model_dir, f"{artifact_name}.pkl")
     
     torch.save({
         'model': model.model_export(),
@@ -371,23 +379,23 @@ def save_training_artifacts(epoch, model, baseline_manager, baseline_explorer,
         'global_df': global_df,
         'timer_df': timer_df,
         'total_time': total_time,
+        'total_queries_seen': total_queries_seen, # Ensure this is in the dict
         'random_state': random_state,
         'args': args_dict,
     }, model_path, _use_new_zipfile_serialization=False)
     
-    baseline_path = os.path.join(model_dir, f"{timestamp}_{artifact_name}_baseline.pkl")
+    # 2. Save the baseline file
+    baseline_path = os.path.join(model_dir, f"{artifact_name}_baseline.pkl")
     with open(baseline_path, 'wb') as f:
         pickle.dump(baseline_manager.data, f)
     
-    results_dir = os.path.join(model_dir, "results")
-    if is_final and os.path.exists("results"):
-        shutil.copytree("results", results_dir, dirs_exist_ok=True)
-    
     metadata = {
-        'timestamp': timestamp,
+        'timestamp': datetime.now().strftime("%Y%m%d_%H%M%S"),
+        'checkpoint_reason': checkpoint_reason,        
         'file_id': FILE_ID,
         'epoch': epoch,
         'total_training_time': total_time,
+        'total_queries_seen': total_queries_seen,
         'training_metrics': {
             'avg_loss': avg_loss,
             'avg_use_gen_loss': avg_use_gen_loss
@@ -405,18 +413,25 @@ def save_training_artifacts(epoch, model, baseline_manager, baseline_explorer,
         }
     }
 
-    metadata_path = os.path.join(model_dir, f"{timestamp}_{artifact_name}_metadata.json")
+    metadata_path = os.path.join(model_dir, f"{artifact_name}_metadata.json")
     with open(metadata_path, 'w') as f:
         json.dump(metadata, f, indent=2)
     
-    print(f"Saved complete artifacts for {artifact_name} to {model_dir}")
+    print(f"Saved complete artifacts for {artifact_name} (Reason: {checkpoint_reason}) to {model_dir}")
 
-def train(beam_width=1, epochs=400, parent_dir='.', args=None):
-    model_dir = Path("/data/hdd1/users/kmparmp/Learned-Optimizers-Benchmarking-Suite/models/experiment1/JOB/LOGER/checkpoints")
-    final_dir = Path("/data/hdd1/users/kmparmp/Learned-Optimizers-Benchmarking-Suite/models/experiment1/JOB/LOGER/final_model")
-    model_dir.mkdir(parents=True, exist_ok=True)
-    final_dir.mkdir(parents=True, exist_ok=True)
+
+def train(beam_width=1, epochs=100, parent_dir='.', args=None):
+    checkpoint_dir_base = Path(args.checkpoint_dir_base)
+    epoch_checkpoint_dir = checkpoint_dir_base / "epoch_checkpoints"
+    query_checkpoint_dir = checkpoint_dir_base / "query_checkpoints"
+    loss_checkpoint_dir = checkpoint_dir_base / "loss_checkpoints"
+    final_dir = checkpoint_dir_base / "final_model"
+    
+    for d in [epoch_checkpoint_dir, query_checkpoint_dir, loss_checkpoint_dir, final_dir]:
+        d.mkdir(parents=True, exist_ok=True)
+            
     checkpoint_file = f'temps/{FILE_ID}.checkpoint.pkl'
+    baseline_explorer = explorer.HalfTimeExplorer(0.5, 0.2, 80)
 
     if not args.load_checkpoint:
         checkpoint_file = f'temps/{FILE_ID}.checkpoint.pkl'
@@ -437,6 +452,8 @@ def train(beam_width=1, epochs=400, parent_dir='.', args=None):
             global_df = dic['global_df']
             timer_df = dic['timer_df']
             total_training_time = dic['total_time']
+            total_queries_seen = dic.get('total_queries_seen', 0)
+            log(f'Loaded total_queries_seen: {total_queries_seen}')            
             random_state = dic.get('random_state', None)
 
             if random_state:
@@ -520,6 +537,7 @@ def train(beam_width=1, epochs=400, parent_dir='.', args=None):
         baseline_explorer = explorer.HalfTimeExplorer(0.5, 0.2, 80)
         baseline_explorer.count = checkpoint.get('baseline_count', 0)
         total_training_time = metadata.get('total_training_time', 0.0)
+        total_queries_seen = metadata.get('total_queries_seen', 0)
 
         if 'sample_weights' in checkpoint:
             sample_weights = checkpoint['sample_weights']
@@ -560,10 +578,15 @@ def train(beam_width=1, epochs=400, parent_dir='.', args=None):
         else:
             start_epoch = 0
 
+    total_queries_seen = 0 # This should be loaded from checkpoint if available
+    best_actual_loss = float('inf')
+    next_epoch_checkpoint_target = args.checkpoint_epoch_interval
+    next_query_checkpoint_target = args.checkpoint_query_interval
+
     _total_train_timer = timer()
     use_beam = beam_width >= 1
 
-    for epoch in range(start_epoch, epochs):
+    for epoch in range(start_epoch, args.max_epochs + 1):
         epoch_start_time = time.time()
         with _total_train_timer:
             if False and epoch >= 100 and epoch % 25 == 0:
@@ -743,6 +766,23 @@ def train(beam_width=1, epochs=400, parent_dir='.', args=None):
                             lr=model.optim.param_groups[0]['lr'],
                         )
                         gen.set_postfix(postfix)
+
+                        total_queries_seen += 1
+
+                        ### MODIFICATION: Query-based checkpointing (triggers mid-epoch)
+                        if total_queries_seen >= next_query_checkpoint_target:
+                            current_avg_loss = np.mean(epoch_losses) if epoch_losses else -1.0
+                            current_avg_use_gen_loss = np.mean(epoch_use_gen_losses) if epoch_use_gen_losses else -1.0
+                            save_training_artifacts(
+                                epoch, model, baseline_manager, baseline_explorer,
+                                sample_weights, train_rcs, database, global_df, timer_df,
+                                total_training_time, get_random_state(), args_dict,
+                                query_checkpoint_dir,  # Save to specific directory
+                                current_avg_loss, current_avg_use_gen_loss, total_queries_seen,
+                                checkpoint_reason="query"
+                            )
+                            next_query_checkpoint_target += args.checkpoint_query_interval
+
                     _Time_train += _plan_timer.time
             _Time_plan -= _Time_database
             _Time_model = _model_timer.time - _Time_database
@@ -750,6 +790,34 @@ def train(beam_width=1, epochs=400, parent_dir='.', args=None):
 
             base_gmrl = np.exp(np.mean(np.log(list(map(lambda x: x[0], baseline_manager.data.values())))))
             log(f'Baseline: {base_gmrl} / {len(baseline_manager.data)}')
+
+            avg_loss = np.mean(epoch_losses) if epoch_losses else float('inf')
+            avg_use_gen_loss = np.mean(epoch_use_gen_losses) if epoch_use_gen_losses else float('inf')
+            print(f"\nEPOCH {epoch} COMPLETE. Total queries seen: {total_queries_seen}. Avg Loss: {avg_loss:.8f}")
+
+            ### MODIFICATION: Epoch-based checkpointing
+            if epoch >= next_epoch_checkpoint_target:
+                save_training_artifacts(
+                    epoch, model, baseline_manager, baseline_explorer,
+                    sample_weights, train_rcs, database, global_df, timer_df,
+                    total_training_time, get_random_state(), args_dict,
+                    epoch_checkpoint_dir,  # Save to specific directory
+                    avg_loss, avg_use_gen_loss, total_queries_seen,
+                    checkpoint_reason="epoch"
+                )
+                next_epoch_checkpoint_target += args.checkpoint_epoch_interval
+
+            ### MODIFICATION: Loss-based checkpointing
+            if (best_actual_loss - avg_loss) > args.loss_improvement_threshold:
+                save_training_artifacts(
+                    epoch, model, baseline_manager, baseline_explorer,
+                    sample_weights, train_rcs, database, global_df, timer_df,
+                    total_training_time, get_random_state(), args_dict,
+                    loss_checkpoint_dir,  # Save to specific directory
+                    avg_loss, avg_use_gen_loss, total_queries_seen,
+                    checkpoint_reason="loss"
+                )
+                best_actual_loss = avg_loss
 
             if epoch >= database.config.validate_start and (epoch + 1) % database.config.validate_interval == 0:
                 with _model_timer:
@@ -829,17 +897,18 @@ def train(beam_width=1, epochs=400, parent_dir='.', args=None):
             'global_df': global_df,
             'timer_df': timer_df,
             'total_time': total_training_time,
+            'total_queries_seen': total_queries_seen,            
             'random_state': random_state,
             'args': args_dict,
         }, checkpoint_file, _use_new_zipfile_serialization=False)
         
-        # Save artifacts after validation
-        save_training_artifacts(
-            epoch, model, baseline_manager, baseline_explorer,
-            sample_weights, train_rcs, database, global_df,
-            timer_df, total_training_time, random_state, args_dict, model_dir, avg_loss, avg_use_gen_loss
-        )
-        
+        condition1_met = (avg_loss < args.loss_threshold) and (epoch > args.min_epochs_for_loss_stop)
+
+        if condition1_met:
+            print("\nSTOPPING CONDITION MET.")
+            print(f"Reason: Model Loss ({avg_loss:.8f}) is below threshold ({args.loss_threshold}) after epoch {args.min_epochs_for_loss_stop}.")
+            break
+
     with open(f'baseline.pkl', 'wb') as f:
         pickle.dump(baseline_manager.data, f)
 
@@ -854,85 +923,99 @@ def train(beam_width=1, epochs=400, parent_dir='.', args=None):
         'global_df': global_df,
         'timer_df': timer_df,
         'total_time': total_training_time,
+        'total_queries_seen': total_queries_seen,        
         'random_state': random_state,
         'args': args_dict,
     }, f'pretrained/step{FILE_ID}.pkl', _use_new_zipfile_serialization=False)
 
-    # Final save at end of training
+    # ===============================================
+    # END OF TRAINING
+    # ===============================================
+    print("\nTraining loop finished.")
+    # Final save of the completed model to its own directory
     save_training_artifacts(
-        epochs-1, model, baseline_manager, baseline_explorer,
-        sample_weights, train_rcs, database, global_df,
-        timer_df, total_training_time, random_state, args_dict, final_dir, avg_loss, avg_use_gen_loss,
-        is_final=True)
+        epoch, model, baseline_manager, baseline_explorer,
+        sample_weights, train_rcs, database, global_df, timer_df,
+        total_training_time, get_random_state(), args_dict, final_dir,
+        avg_loss, avg_use_gen_loss, total_queries_seen, is_final=True, checkpoint_reason="final"
+    )
 
 if __name__ == '__main__':
+    # Using add_help=False to add a custom help group later
     import argparse
+    parser = argparse.ArgumentParser(description="Run standardized training for LOGER.", add_help=False)
 
-    parser = argparse.ArgumentParser(add_help=False)
+    # --- Group 1: Required Paths & Core Settings ---
+    required_group = parser.add_argument_group('Required Paths & Core Settings')
     
-    # --- FEATURE UPDATE: Mutually exclusive group for dataset source ---
-    dataset_group = parser.add_mutually_exclusive_group(required=True)
+    ### MODIFICATION: Replaced --dataset with the mutually exclusive group ###
+    dataset_group = required_group.add_mutually_exclusive_group(required=True)
     dataset_group.add_argument('-d', '--dataset', nargs=2, type=str,
-                               help='Paths to pre-split training and testing dataset directories.')
+                               help='Paths to pre-split training and testing dataset directories (e.g., --dataset ./train ./test).')
     dataset_group.add_argument('--split_source_dir', type=str,
-                               help='Path to a source directory to be split 80/20 into train/test sets.')
+                               help='Path to a single source directory to be randomly split 80/20 into train/test sets.')
 
-    parser.add_argument('-e', '--epochs', type=int, default=50,
-                        help='Total epochs.')
-    parser.add_argument('-F', '--id', type=str, default=FILE_ID,
-                        help='File ID.')
-    parser.add_argument('-b', '--beam', type=int, default=4,
-                        help='Beam width. A beam width less than 1 indicates simple epsilon-greedy policy.')
-    parser.add_argument('-s', '--switches', type=int, default=4,
-                        help='Branch amount of join methods.')
-    parser.add_argument('-l', '--layers', type=int, default=1,
-                        help='Number of graph transformer layer in the model.')
-    parser.add_argument('-w', '--weight', type=float, default=0.1,
-                        help='The weight of reward weighting.')
-    parser.add_argument('-N', '--no-restricted-operator', action='store_true',
-                        help='Not to use restricted operators.')
-    parser.add_argument('--oracle', type=str, default=None, # database/password@localhost:1521
-                        help='To use oracle with given connection settings.')
-    parser.add_argument('--cache-name', type=str, default=None,
-                        help='Cache file name.')
-    parser.add_argument('--bushy', action='store_true',
-                        help='To use bushy search space.')
-    parser.add_argument('--log-cap', type=float, default=1.0,
-                        help='Cap of log transformation.')
-    parser.add_argument('--warm-up', type=int, default=None,
-                        help='To warm up the database with specific iterations.')
-    parser.add_argument('--no-exploration', action='store_true',
-                        help='To use the original beam search.')
-    parser.add_argument('--no-expert-initialization', action='store_true',
-                        help='To discard initializing the replay memory with expert knowledge.')
-    parser.add_argument('-p', '--pretrain', type=str, default=None,
-                        help='Pretrained checkpoint.')
-    parser.add_argument('-S', '--seed', type=int, default=3407,
-                        help='Random seed.')
-    parser.add_argument('-D', '--database', type=str, default='imdbload',
-                        help='PostgreSQL database.')    
-    parser.add_argument('-U', '--user', type=str, default='suite_user',
-                        help='PostgreSQL user.')
-    parser.add_argument('-P', '--password', type=str, default='71Vgfi4mUNPm',
-                        help='PostgreSQL user password.')
-    parser.add_argument('--port', type=int, default=5471,
-                        help='PostgreSQL port.')
-    parser.add_argument('-H', '--host', type=str, default='train.darelab.athenarc.gr', 
-                        help='PostgreSQL host.')
-    parser.add_argument('-o','--query_order', type=str,
-                        help='To use the query order file.')
-    parser.add_argument('--load_checkpoint', action='store_true',
-                        help='To load model checkpoint.')
+    required_group.add_argument('-F', '--id', type=str, required=True,
+                                help='A unique File ID for this training run (e.g., "loger_job_exp3").')
+    required_group.add_argument('--checkpoint_dir_base', type=str, required=True,
+                                help='Base directory to save all checkpoints and the final model.')
+    
+    # --- Group 2: Standardized Training Control (Your Experiment's Args) ---
+    exp_group = parser.add_argument_group('Standardized Training Control')
+    exp_group.add_argument('--max_epochs', type=int, default=100,
+                           help='Maximum number of full passes over the training dataset.')
+    exp_group.add_argument('--min_epochs_for_loss_stop', type=int, default=50,
+                           help='Minimum epochs to run before loss-based stopping can occur.')
+    exp_group.add_argument('--loss_threshold', type=float, default=0.001,
+                           help="Model's avg epoch loss threshold for early stopping.")
+    exp_group.add_argument('--checkpoint_epoch_interval', type=int, default=10,
+                           help='Save a checkpoint every N epochs.')
+    exp_group.add_argument('--checkpoint_query_interval', type=int, default=1000,
+                           help='Save a checkpoint every N queries processed.')
+    exp_group.add_argument('--loss_improvement_threshold', type=float, default=0.0001,
+                           help='Save a checkpoint if model loss improves by at least this much.')
+
+    # --- Group 3: LOGER-Specific Hyperparameters ---
+    # ... (This group remains unchanged) ...
+    loger_group = parser.add_argument_group('LOGER Hyperparameters')
+    loger_group.add_argument('-b', '--beam', type=int, default=4, help='Beam width. A beam width < 1 indicates simple epsilon-greedy policy.')
+    loger_group.add_argument('-s', '--switches', type=int, default=4, help='Branch amount of join methods.')
+    loger_group.add_argument('-l', '--layers', type=int, default=1, help='Number of graph transformer layers in the model.')
+    loger_group.add_argument('-w', '--weight', type=float, default=0.1, help='The weight of reward weighting.')
+    loger_group.add_argument('--log-cap', type=float, default=1.0, help='Cap of log transformation.')
+
+    # --- Group 4: Database Connection ---
+    # ... (This group remains unchanged) ...
+    db_group = parser.add_argument_group('Database Connection')
+    db_group.add_argument('-D', '--database', type=str, default='imdbload', help='PostgreSQL database.')    
+    db_group.add_argument('-U', '--user', type=str, default='suite_user', help='PostgreSQL user.')
+    db_group.add_argument('-P', '--password', type=str, default='71Vgfi4mUNPm', help='PostgreSQL user password.')
+    db_group.add_argument('--port', type=int, default=5469, help='PostgreSQL port.')
+    db_group.add_argument('-H', '--host', type=str, default='train.darelab.athenarc.gr', help='PostgreSQL host.')
+    db_group.add_argument('--oracle', type=str, default=None, help='To use oracle with given connection settings.')
+
+    # --- Group 5: Advanced & Optional Settings ---
+    # ... (This group remains unchanged) ...
+    optional_group = parser.add_argument_group('Advanced & Optional Settings')
+    optional_group.add_argument('-o','--query_order', type=str, help='Path to a file specifying the order of training queries.')
+    optional_group.add_argument('--load_checkpoint', action='store_true', help='To load model checkpoint from the temporary file.')
+    optional_group.add_argument('-p', '--pretrain', type=str, default=None, help='Path to a pretrained checkpoint to start from.')
+    optional_group.add_argument('-S', '--seed', type=int, default=3407, help='Random seed.')
+    optional_group.add_argument('--bushy', action='store_true', help='To use bushy search space.')
+    optional_group.add_argument('--no-exploration', action='store_true', help='To use the original beam search without exploration.')
+    optional_group.add_argument('--no-expert-initialization', action='store_true', help='To discard initializing the replay memory with expert knowledge.')
+    optional_group.add_argument('--cache-name', type=str, default=None, help='Cache file name. Defaults to the File ID.')
+    optional_group.add_argument('--warm-up', type=int, default=None, help='To warm up the database with specific iterations.')
+    optional_group.add_argument('-N', '--no-restricted-operator', action='store_true', help='Not to use restricted operators.')
+    
+    # Add help argument now that groups are defined
+    optional_group.add_argument('-h', '--help', action='help', help='show this help message and exit')
 
     args = parser.parse_args()
-
     args_dict = vars(args)
 
     FILE_ID = args.id
-
     log = Logger(f'log/{FILE_ID}.log', buffering=1, stderr=True)
-
-    #torch.use_deterministic_algorithms(True)
     seed(args.seed)
     SEED = args.seed
 
@@ -1051,4 +1134,4 @@ if __name__ == '__main__':
 
     database.config.beam_width = args.beam
 
-    train(beam_width=args.beam, epochs=args.epochs, parent_dir = parent_dir, args=args)
+    train(beam_width=args.beam, epochs=args.max_epochs, parent_dir=parent_dir, args=args)

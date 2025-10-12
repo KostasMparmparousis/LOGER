@@ -66,8 +66,11 @@ class TableTransform(torch.nn.Module):
         ], dim=-1)
 
         onehot_embedding : torch.Tensor = self.onehot_embedding(table_encoding).reshape(-1, self.__hidden_size, self.__hidden_size)
-
-        table_others = self.schema_prepare(table_others)
+        # print("onehot_embedding shape:", onehot_embedding.shape)
+        # print("table_others shape:", table_others.shape)
+        # print("table_global shape:", table_global.shape)
+        # print("table_others:", table_others)
+        table_others = self.schema_prepare(table_others.float())
         onehot_embedding = torch.bmm(table_others, onehot_embedding)
         onehot_embedding = self.schema_embedding(onehot_embedding)
 

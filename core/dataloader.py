@@ -20,8 +20,42 @@ def _load(directory, verbose=False):
             res.append((data, file))
     return res
 
+def _parse_and_create_sql_objects_with_detail(sql_files_with_data, config, device, verbose=False):
+    """
+    Parses a list of SQL file contents, creates Sql objects, and records parsing time.
+
+    Args:
+        sql_files_with_data (list): A list of tuples, where each tuple is (sql_string, filename).
+        config: The database configuration object.
+        device: The torch device.
+        verbose (bool): Whether to show a progress bar.
+
+    Returns:
+        tuple: A tuple containing (list_of_Sql_objects, list_of_parsing_times).
+    """
+    _timer = timer()
+    res = []
+    _detail = []
+    
+    gen = sql_files_with_data
+    if verbose:
+        gen = tqdm(gen, desc='Parsing')
+
+    for sql, filename in gen:
+        print(filename)
+        fname = os.path.basename(filename)
+        with _timer:
+            # Note: The original code reassigns `sql` to be the Sql object.
+            # Here, we use `sql_obj` for clarity.
+            sql_obj = Sql(sql, config.feature_length, filename=fname)
+        _detail.append(_timer.time)
+        sql_obj.to(device)
+        res.append(sql_obj)
+    
+    return res, _detail
 
 def load(config, directory, device=torch.device('cpu'), verbose=False, detail=False):
+    # This function is now refactored to use the helper function
     _timer = timer()
 
     # Ensure directory is absolute
@@ -40,20 +74,10 @@ def load(config, directory, device=torch.device('cpu'), verbose=False, detail=Fa
     if os.path.isfile(cache_file):
         return torch.load(cache_file, map_location=device)
 
-    res = []
-    _detail = []
-    gen = _load(directory, verbose=verbose)
-    if verbose:
-        gen = tqdm(gen, desc='Parsing')
-
-    for sql, filename in gen:
-        print(filename)
-        fname = os.path.basename(filename)
-        with _timer:
-            sql = Sql(sql, config.feature_length, filename=fname)
-        _detail.append((_timer.time))
-        sql.to(device)
-        res.append(sql)
+    sql_files_with_data = _load(directory, verbose=verbose)
+    res, _detail = _parse_and_create_sql_objects_with_detail(
+        sql_files_with_data, config, device, verbose=verbose
+    )
 
     if detail:
         torch.save((res, _detail), cache_file)

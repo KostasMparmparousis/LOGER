@@ -17,7 +17,7 @@ import time
 from lib.randomize import seed, get_random_state, set_random_state
 
 # Configuration - Updated with your paths
-MODEL_DIR = "/data/hdd1/users/kmparmp/Learned-Optimizers-Benchmarking-Suite/models/experiment5/5.3/LOGER"
+MODEL_DIR = "/data/hdd1/users/kmparmp/Learned-Optimizers-Benchmarking-Suite/models/experiment5/5.3/LOGER/stack_2011/checkpoints"
 FINAL_MODEL_PATH = os.path.join(MODEL_DIR, "20250818_062634_epoch25_1.pkl")
 FINAL_METADATA_PATH = os.path.join(MODEL_DIR, "20250818_062634_epoch25_1_metadata.json")
 FINAL_BASELINE_PATH = os.path.join(MODEL_DIR, "20250818_062634_epoch25_1_baseline.pkl")
@@ -35,7 +35,7 @@ FILE_ID = '1'
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 log = Logger(f'log/{FILE_ID}.test.log', buffering=1, stderr=True)
 
-def find_sql_files(directory, skip_loger_processed=False):
+def find_sql_files(directory, skip_loger_processed=False, base_year=2011, tested_year=2015):
     """Recursively find only .sql files in a directory, ignoring files if LOGER/ exists"""
     sql_files = []
     for root, dirs, files in os.walk(directory):
@@ -43,18 +43,21 @@ def find_sql_files(directory, skip_loger_processed=False):
             if file.endswith('.sql'):
                 full_path = os.path.join(root, file)
                 if skip_loger_processed:
-                    loger_dir = os.path.join(root, "LOGER")
+                    loger_dir = os.path.join(root, f"{base_year}_models/LOGER")
                     if os.path.exists(loger_dir):
-                        # print(f"Skipping {full_path} as LOGER directory already exists")
-                        continue
+                        # If there is a .json.{tested_year} file in the LOGER directory, skip this SQL file
+                        json_file = os.path.join(loger_dir, f"{os.path.splitext(file)[0]}_loger_plan.json.{tested_year}")
+                        if os.path.exists(json_file):
+                            print(f"Skipping {full_path} as LOGER directory already exists")
+                            continue
 
                 sql_files.append(full_path)
     return sql_files
 
-def load_sql_files(directory, verbose=False, skip_loger_processed=False):
+def load_sql_files(directory, verbose=False, skip_loger_processed=False, base_year=2011, tested_year=2015):
     """Load SQL files and ensure they're on the correct device"""
-    sql_files = find_sql_files(directory, skip_loger_processed=skip_loger_processed)
-    
+    sql_files = find_sql_files(directory, skip_loger_processed=skip_loger_processed, base_year=base_year, tested_year=tested_year)
+
     if verbose:
         print(f"Found {len(sql_files)} SQL files")
 
@@ -247,7 +250,9 @@ def load_model_and_artifacts():
         baseline_manager.load_state_dict(checkpoint['baseline'])
     if 'timeout_limit' in checkpoint:
         database.statement_timeout = checkpoint['timeout_limit']
-    
+    # Set query timeout to 10 minutes
+    database.statement_timeout = 600000
+    print("Set database statement timeout to 600000 ms")
     print(database.statement_timeout)
     model.eval_mode()
     return model, baseline_manager, metadata
@@ -255,8 +260,9 @@ def load_model_and_artifacts():
 def initialize_db(args):
     """Initialize database connection with proper error handling"""
     try:
+        dbname = f'stack_{args.tested_year}' if hasattr(args, 'tested_year') else args.database
         database.setup(
-            dbname=args.database,
+            dbname=dbname,
             user=args.user,
             password=args.password,
             host=args.host,
@@ -419,10 +425,10 @@ def save_plan(plan_data, output_path):
     with open(output_path, 'w') as f:
         json.dump(plan_data, f, indent=2)
 
-def test_loger_model(model, workload_path, verbose=False, skip_loger_processed=False):
+def test_loger_model(model, workload_path, verbose=False, skip_loger_processed=False, base_year=2011, tested_year=2015):
     """Test LOGER model with proper device handling"""
     model.to(device)  # Ensure model is on correct device
-    sql_objects = load_sql_files(workload_path, verbose=verbose)
+    sql_objects = load_sql_files(workload_path, verbose=verbose, skip_loger_processed=skip_loger_processed, base_year=base_year, tested_year=tested_year)
     
     results = []
     q_errors = []
@@ -457,14 +463,15 @@ def test_loger_model(model, workload_path, verbose=False, skip_loger_processed=F
                     q_errors.append(q_error)
 
                     # Save plan
-                    loger_dir = os.path.join(os.path.dirname(full_path), "LOGER")
+
+                    loger_dir = os.path.join(os.path.dirname(full_path), f'{base_year}_models/LOGER')
                     if NUM_EXECUTIONS > 1:
                         run_dir = os.path.join(loger_dir, f"run{count+1}")
                         os.makedirs(run_dir, exist_ok=True)
-                        plan_path = os.path.join(run_dir, f"{os.path.splitext(os.path.basename(rel_path))[0]}_loger_plan.json")
+                        plan_path = os.path.join(run_dir, f"{os.path.splitext(os.path.basename(rel_path))[0]}_loger_plan.json.{tested_year}")
                     else:
                         os.makedirs(loger_dir, exist_ok=True)
-                        plan_path = os.path.join(loger_dir, f"{os.path.splitext(os.path.basename(rel_path))[0]}_loger_plan.json")
+                        plan_path = os.path.join(loger_dir, f"{os.path.splitext(os.path.basename(rel_path))[0]}_loger_plan.json.{tested_year}")
                     with open(plan_path, 'w') as f:
                         json.dump(plan_json, f, indent=2)
 
@@ -489,7 +496,7 @@ def test_loger_model(model, workload_path, verbose=False, skip_loger_processed=F
                             'q_error': q_error,
                             'inference_time': inference_time
                         }, f, indent=2)
-
+                    print(f"Saved plan to {plan_path} and metrics to {results_path}")
                     if verbose:
                         print(f"Processed {rel_path} on {device}: "
                             f"Predicted {predicted_latency:.2f}s, "
@@ -560,9 +567,11 @@ if __name__ == '__main__':
     parser.add_argument('-U', '--user', default='suite_user', help='Database user')
     parser.add_argument('-P', '--password', default='71Vgfi4mUNPm', help='Database password')
     parser.add_argument('--host', default='train.darelab.athenarc.gr', help='Database host')
-    parser.add_argument('--port', type=int, default=5468, help='Database port')
+    parser.add_argument('--port', type=int, default=5469, help='Database port')
     parser.add_argument('--skip_loger_processed', action='store_true',
                         help='Skip already processed LOGER queries')
+    parser.add_argument('--base_year', type=int, default=2011, help='Base year for query generation')
+    parser.add_argument('--tested_year', type=int, default=2011, help='End year for query generation')
     args = parser.parse_args()
     skip_loger_processed = args.skip_loger_processed
     # Initialize database
@@ -571,7 +580,6 @@ if __name__ == '__main__':
     # Load model and artifacts
     try:
         model, baseline_manager, metadata = load_model_and_artifacts()
-        model.eval_mode()
         log("Successfully loaded model and artifacts")
     except Exception as e:
         log(f"Failed to load model: {e}")
@@ -582,7 +590,9 @@ if __name__ == '__main__':
         model,
         args.workload_path,
         verbose=args.verbose,
-        skip_loger_processed=skip_loger_processed
+        skip_loger_processed=skip_loger_processed,
+        base_year=args.base_year,
+        tested_year=args.tested_year
     )
 
     # Save results

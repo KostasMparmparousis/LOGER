@@ -14,7 +14,7 @@ from core import config
 
 class _global:
     geqo_threshold = 2
-    statement_timeout = 15 * 60 * 1000  # in milliseconds
+    statement_timeout = 1000000
     auto_save_interval = 400
 
     def __init__(self):
