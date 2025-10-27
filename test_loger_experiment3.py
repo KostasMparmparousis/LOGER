@@ -404,8 +404,26 @@ def main(args):
             print(f"FATAL ERROR while processing {Path(model_path).name}: {e}")
             continue
 
+import os
+from dotenv import load_dotenv
+
+def load_repo_env():
+    """Find and load the .env file from repo root."""
+    current_dir = os.path.abspath(os.path.dirname(__file__))
+    while True:
+        env_path = os.path.join(current_dir, ".env")
+        if os.path.exists(env_path):
+            load_dotenv(env_path)
+            break
+        parent_dir = os.path.dirname(current_dir)
+        if parent_dir == current_dir:
+            raise FileNotFoundError(".env file not found.")
+        current_dir = parent_dir
+
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Systematically evaluate all LOGER training checkpoints.")
+    load_repo_env()
     
     parser.add_argument("checkpoint_dir_base", type=str,
                         help="The base directory containing the 'epoch_checkpoints', etc. subdirectories.")
@@ -414,10 +432,34 @@ if __name__ == '__main__':
     
     # --- DB Arguments ---
     parser.add_argument("--db_name", type=str, default="imdbload", help="Postgres Database name.")
-    parser.add_argument("--user", type=str, default="suite_user", help="Postgres user.")
-    parser.add_argument("--password", type=str, default="71Vgfi4mUNPm", help="Postgres password.")
-    parser.add_argument("--host", type=str, default="train.darelab.athenarc.gr", help="Postgres host.")
-    parser.add_argument("--port", type=int, default=5469, help="Postgres port.")
-    
+    parser.add_argument('-U', '--user', default=os.getenv("DB_USER"), help='Database user')
+    parser.add_argument('-P', '--password', default=os.getenv("DB_PASS"), help='Database password')
+    parser.add_argument('--host', default=os.getenv("DB_HOST"), help='Database host')
+
+    default_port = os.getenv("DB_PORT")  # may be None
+    db_port_map = {
+        "imdbload": os.getenv("IMDB_PORT"),
+        "tpch": os.getenv("TPCH_PORT"),
+        "tpcds": os.getenv("TPCDS_PORT"),
+        "ssb": os.getenv("SSB_PORT"),
+    }
+
+    # stack_* databases handled together
+    if not default_port:
+        if "stack" in os.getenv("DB_NAME", ""):
+            default_port = os.getenv("STACK_PORT", "5432")
+        else:
+            default_port = db_port_map.get(os.getenv("DB_NAME", ""), "5432")
+
+    parser.add_argument('--port', type=int, default=int(default_port or "5432"),
+                        help='Database port')
     args = parser.parse_args()
+
+    if not os.getenv("DB_PORT"):  # only adjust if not globally defined
+        if args.database in db_port_map and db_port_map[args.database]:
+            args.port = int(db_port_map[args.database])
+        elif "stack" in args.database.lower():
+            args.port = int(os.getenv("STACK_PORT", "5432"))
+        else:
+            args.port = 5432
     main(args)

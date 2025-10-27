@@ -10,8 +10,6 @@ import numpy as np
 import traceback
 
 # --- Configuration ---
-MODEL_DIR = "/data/hdd1/users/kmparmp/Learned-Optimizers-Benchmarking-Suite/models/experiment3/LOGER/epoch_checkpoints/"
-FINAL_MODEL_PATH = os.path.join(MODEL_DIR, "epoch-100_queries-9090_loss-0.003558_reason-epoch_loger_job_exp3.pkl")
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 # --- Helper Functions (from previous versions) ---
@@ -51,9 +49,11 @@ def initialize_db(args):
         log(f"Error setting up database: {e}")
         raise RuntimeError("Database connection failed.")
 
-def load_loger_model():
-    print(f"Loading LOGER model from: {FINAL_MODEL_PATH}")
-    checkpoint = torch.load(FINAL_MODEL_PATH, map_location=DEVICE)
+def load_loger_model(model_path):
+    print(f"Loading LOGER model from: {model_path}")
+    if not os.path.exists(model_path):
+        raise FileNotFoundError(f"Model file not found: {model_path}")
+    checkpoint = torch.load(model_path, map_location=DEVICE)
     model = DeepQNet(
         device=DEVICE, half=200, out_dim=4, num_table_layers=1,
         use_value_predict=False, restricted_operator=True,
@@ -224,19 +224,64 @@ def generate_analysis_artifacts(model, sql_objects):
                 traceback.print_exc()
                 continue
 
+import os
+from dotenv import load_dotenv
+
+def load_repo_env():
+    """Find and load the .env file from repo root."""
+    current_dir = os.path.abspath(os.path.dirname(__file__))
+    while True:
+        env_path = os.path.join(current_dir, ".env")
+        if os.path.exists(env_path):
+            load_dotenv(env_path)
+            break
+        parent_dir = os.path.dirname(current_dir)
+        if parent_dir == current_dir:
+            raise FileNotFoundError(".env file not found.")
+        current_dir = parent_dir
+
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Generate LOGER and PostgreSQL analysis artifacts (plans and embeddings).')
     parser.add_argument('workload_path', type=str, help='Path to workload directory with .sql files')
     parser.add_argument('-D', '--database', default='imdbload', help='Database name')
-    parser.add_argument('-U', '--user', default='suite_user', help='Database user')
-    parser.add_argument('-P', '--password', default='71Vgfi4mUNPm', help='Database password')
-    parser.add_argument('--host', default='train.darelab.athenarc.gr', help='Database host')
-    parser.add_argument('--port', type=int, default=5469, help='Database port')
-    parser.add_argument('--skip_loger_processed', action='store_true', help='Skip queries that already have a LOGER directory')
+    parser.add_argument('-U', '--user', default=os.getenv("DB_USER"), help='Database user')
+    parser.add_argument('-P', '--password', default=os.getenv("DB_PASS"), help='Database password')
+    parser.add_argument('--host', default=os.getenv("DB_HOST"), help='Database host')
+
+    default_port = os.getenv("DB_PORT")  # may be None
+    db_port_map = {
+        "imdbload": os.getenv("IMDB_PORT"),
+        "tpch": os.getenv("TPCH_PORT"),
+        "tpcds": os.getenv("TPCDS_PORT"),
+        "ssb": os.getenv("SSB_PORT"),
+    }
+
+    # stack_* databases handled together
+    if not default_port:
+        if "stack" in os.getenv("DB_NAME", ""):
+            default_port = os.getenv("STACK_PORT", "5432")
+        else:
+            default_port = db_port_map.get(os.getenv("DB_NAME", ""), "5432")
+
+    parser.add_argument('--port', type=int, default=int(default_port or "5432"),
+                        help='Database port')
+    parser.add_argument('--skip_loger_processed', action='store_true',
+                        help='Skip already processed LOGER queries')
+    parser.add_argument('--checkpoint_path', type=str, required=True,
+                        help='Path to the trained LOGER model file (.pkl)')
     args = parser.parse_args()
 
+    if not os.getenv("DB_PORT"):  # only adjust if not globally defined
+        if args.database in db_port_map and db_port_map[args.database]:
+            args.port = int(db_port_map[args.database])
+        elif "stack" in args.database.lower():
+            args.port = int(os.getenv("STACK_PORT", "5432"))
+        else:
+            args.port = 5432
+
     initialize_db(args)
-    model = load_loger_model()
+    model = load_loger_model(args.model_path)
     sql_objects = load_sql_objects(args.workload_path, skip_loger_processed=args.skip_loger_processed)
     generate_analysis_artifacts(model, sql_objects)
     print("\nProcessing complete.")

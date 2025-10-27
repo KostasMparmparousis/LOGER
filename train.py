@@ -3,10 +3,12 @@ FILE_ID = '1'
 import typing
 import os
 from lib.randomize import seed, get_random_state, set_random_state
+from pathlib import Path
 
 seed(0)
 
 import torch
+import glob
 import random
 from collections.abc import Iterable
 from tqdm import tqdm
@@ -18,7 +20,8 @@ from lib.log import Logger
 from lib.timer import timer
 from lib.cache import HashCache
 import time
-from core import database, Sql, Plan, load
+from core import database, Sql, Plan
+from core.dataloader import load, _load, _parse_and_create_sql_objects_with_detail
 from model.dqn import DeepQNet
 from model import explorer
 from datetime import datetime
@@ -27,7 +30,6 @@ import shutil
 
 from core.oracle import oracle_database
 USE_ORACLE = False
-
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 USE_LATENCY = True
@@ -306,18 +308,15 @@ def database_warmup(train_set, k=400):
 
 def save_training_artifacts(epoch, model, baseline_manager, baseline_explorer, 
                            sample_weights, train_rcs, database, global_df, 
-                           timer_df, total_time, random_state, args_dict,
-                           is_final=False):
+                           timer_df, total_time, random_state, args_dict, model_dir,
+                           avg_loss, avg_use_gen_loss, is_final=False):
     """Save complete training artifacts to central directory"""
     # Configuration
-    model_dir = "/data/hdd1/users/kmparmp/models/loger/job-added-index"
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    run_dir = os.path.join(model_dir, f"run_{FILE_ID}")
-    os.makedirs(run_dir, exist_ok=True)
     
     # 1. Save model checkpoint with all original fields
     artifact_name = f"final_{FILE_ID}" if is_final else f"epoch{epoch}_{FILE_ID}"
-    model_path = os.path.join(run_dir, f"{timestamp}_{artifact_name}.pkl")
+    model_path = os.path.join(model_dir, f"{timestamp}_{artifact_name}.pkl")
     
     torch.save({
         'model': model.model_export(),
@@ -334,11 +333,11 @@ def save_training_artifacts(epoch, model, baseline_manager, baseline_explorer,
         'args': args_dict,
     }, model_path, _use_new_zipfile_serialization=False)
     
-    baseline_path = os.path.join(run_dir, f"{timestamp}_{artifact_name}_baseline.pkl")
+    baseline_path = os.path.join(model_dir, f"{timestamp}_{artifact_name}_baseline.pkl")
     with open(baseline_path, 'wb') as f:
         pickle.dump(baseline_manager.data, f)
     
-    results_dir = os.path.join(run_dir, "results")
+    results_dir = os.path.join(model_dir, "results")
     if is_final and os.path.exists("results"):
         shutil.copytree("results", results_dir, dirs_exist_ok=True)
     
@@ -347,6 +346,10 @@ def save_training_artifacts(epoch, model, baseline_manager, baseline_explorer,
         'file_id': FILE_ID,
         'epoch': epoch,
         'total_training_time': total_time,
+        'training_metrics': {
+            'avg_loss': avg_loss,
+            'avg_use_gen_loss': avg_use_gen_loss
+        },        
         'baseline_stats': {
             'count': len(baseline_manager.data),
             'gmrl': np.exp(np.mean(np.log(
@@ -360,85 +363,180 @@ def save_training_artifacts(epoch, model, baseline_manager, baseline_explorer,
         }
     }
 
-    metadata_path = os.path.join(run_dir, f"{timestamp}_{artifact_name}_metadata.json")
+    metadata_path = os.path.join(model_dir, f"{timestamp}_{artifact_name}_metadata.json")
     with open(metadata_path, 'w') as f:
         json.dump(metadata, f, indent=2)
     
-    print(f"Saved complete artifacts for {artifact_name} to {run_dir}")
+    print(f"Saved complete artifacts for {artifact_name} to {model_dir}")
 
-def train(beam_width=1, epochs=400):
+def train(beam_width=1, epochs=400, args=None):
+    model_dir = Path(args.target_checkpoint_dir).joinpath('checkpoints')
+    final_dir = Path(args.target_checkpoint_dir).joinpath('final_model')
+    model_dir.mkdir(parents=True, exist_ok=True)
+    final_dir.mkdir(parents=True, exist_ok=True)
     checkpoint_file = f'temps/{FILE_ID}.checkpoint.pkl'
-    baseline_explorer = explorer.HalfTimeExplorer(0.5, 0.2, 80)
 
-    if os.path.isfile(checkpoint_file):
-        dic = torch.load(checkpoint_file, map_location=device)
-        model.model_recover(dic['model'])
-        start_epoch = dic['epoch'] + 1
-        model.schedule(start_epoch)
-        baseline_manager = BaselineCache()
-        baseline_manager.load_state_dict(dic['baseline'])
-        sample_weights = dic['sample_weights']
-        train_rcs = dic['train_rcs']
-        if 'timeout_limit' in dic:
-            database.statement_timeout = dic['timeout_limit']
-        baseline_explorer.count = dic['baseline_count']
-        global_df = dic['global_df']
-        timer_df = dic['timer_df']
-        total_training_time = dic['total_time']
-        random_state = dic.get('random_state', None)
+    if not args.checkpoint_dir or not os.path.isdir(args.checkpoint_dir):
+        checkpoint_file = f'temps/{FILE_ID}.checkpoint.pkl'
+        baseline_explorer = explorer.HalfTimeExplorer(0.5, 0.2, 80)
 
-        if random_state:
-            set_random_state(random_state)
-            log('Loaded random state')
-    else:
-        total_training_time = 0.0
+        if os.path.isfile(checkpoint_file):
+            dic = torch.load(checkpoint_file, map_location=device)
+            model.model_recover(dic['model'])
+            start_epoch = dic['epoch'] + 1
+            model.schedule(start_epoch)
+            baseline_manager = BaselineCache()
+            baseline_manager.load_state_dict(dic['baseline'])
+            sample_weights = dic['sample_weights']
+            train_rcs = dic['train_rcs']
+            if 'timeout_limit' in dic:
+                database.statement_timeout = dic['timeout_limit']
+            baseline_explorer.count = dic['baseline_count']
+            global_df = dic['global_df']
+            timer_df = dic['timer_df']
+            total_training_time = dic['total_time']
+            random_state = dic.get('random_state', None)
 
-        baseline_pkl = f'{FILE_ID}.baseline.pkl'
-        start_epoch = 0
-        log('Preprocessing baselines')
-        baseline_manager = BaselineCache()
-        if os.path.isfile(baseline_pkl):
-            with open(baseline_pkl, 'rb') as f:
-                baseline_manager.load_state_dict(pickle.load(f))
-                if USE_LATENCY:
-                    baseline_manager.set_timeout()
+            if random_state:
+                set_random_state(random_state)
+                log('Loaded random state')
         else:
-            baseline_manager.init(train_set, verbose=True)
-            if args.no_expert_initialization:
-                baseline_manager.data.clear()
-            with open(baseline_pkl, 'wb') as f:
-                pickle.dump(baseline_manager.state_dict(), f)
-        sample_weights = None
-        train_rcs = None
+            total_training_time = 0.0
+            print('No checkpoint found, starting from scratch')
+            baseline_pkl = f'{FILE_ID}.baseline.pkl'
+            start_epoch = 0
+            log('Preprocessing baselines')
+            baseline_manager = BaselineCache()
+            if os.path.isfile(baseline_pkl):
+                print(f'Loading baseline from {baseline_pkl}')
+                with open(baseline_pkl, 'rb') as f:
+                    baseline_manager.load_state_dict(pickle.load(f))
+                    if USE_LATENCY:
+                        baseline_manager.set_timeout()
+            else:
+                print('No baseline found, initializing from training set')
+                print(f'Baseline data: {baseline_manager.data}')
+                baseline_manager.init(train_set, verbose=True)
+                if args.no_expert_initialization:
+                    baseline_manager.data.clear()
+                with open(baseline_pkl, 'wb') as f:
+                    pickle.dump(baseline_manager.state_dict(), f)
+            sample_weights = None
+            train_rcs = None
 
-        global_df = []
-        timer_df = []
-        if not args.no_expert_initialization:
-            log('Adding baselines to memory')
-            for sql in train_set:
-                baseline_order = baseline_manager.get(sql)
-                if baseline_order is not None:
-                    baseline_value = baseline_manager.get_cost(sql)
-                    with torch.no_grad():
-                        plan = model.init(sql)
-                        while not plan.completed:
-                            prev_plan = plan.clone()
-                            action, join = baseline_order[plan.total_branch_nodes]
-                            model.step(plan, action, join=join)
-                            model.add_memory(prev_plan, baseline_value, info=(action, 0,), is_baseline=True)
-        if beam_width <= 0:
-            postfix = dict(
-                loss='/',
-            )
-            gen = tqdm(range(50), total=50, desc='Pretraining', postfix=postfix)
-            for i in gen:
-                loss, _ = model.train(False)
-                postfix.update(
-                    loss=loss.item()
+            global_df = []
+            timer_df = []
+            if not args.no_expert_initialization:
+                log('Adding baselines to memory')
+                for sql in train_set:
+                    baseline_order = baseline_manager.get(sql)
+                    if baseline_order is not None:
+                        baseline_value = baseline_manager.get_cost(sql)
+                        with torch.no_grad():
+                            print(f'Adding baseline for {sql.filename}')
+                            print("Sql:", sql)
+                            plan = model.init(sql)
+                            while not plan.completed:
+                                prev_plan = plan.clone()
+                                action, join = baseline_order[plan.total_branch_nodes]
+                                model.step(plan, action, join=join)
+                                model.add_memory(prev_plan, baseline_value, info=(action, 0,), is_baseline=True)
+            if beam_width <= 0:
+                postfix = dict(
+                    loss='/',
                 )
-                gen.set_postfix(postfix)
+                gen = tqdm(range(50), total=50, desc='Pretraining', postfix=postfix)
+                for i in gen:
+                    loss, _ = model.train(False)
+                    postfix.update(
+                        loss=loss.item()
+                    )
+                    gen.set_postfix(postfix)
 
-        seed(SEED)
+            seed(SEED)
+    else:
+        def load_file(path, mode, loader):
+            with open(path, mode) as f:
+                return loader(f)
+
+        def check_paths_exist(paths):
+            missing = [p for p in paths if not os.path.exists(p)]
+            if missing:
+                raise FileNotFoundError(f"Missing required files: {', '.join(missing)}")
+
+        model_dir = args.checkpoint_dir
+        files = os.listdir(model_dir)
+
+        # Identify model, metadata, and baseline files by name pattern
+        model_candidates = [f for f in files if f.endswith(".pkl") and "baseline" not in f]
+        baseline_candidates = [f for f in files if f.endswith("_baseline.pkl")]
+        metadata_candidates = [f for f in files if f.endswith(".json")]
+
+        if not model_candidates:
+            raise FileNotFoundError(f"No model checkpoint (*.pkl) found in {model_dir}")
+        if not metadata_candidates:
+            raise FileNotFoundError(f"No metadata (*.json) found in {model_dir}")
+        if not baseline_candidates:
+            raise FileNotFoundError(f"No baseline (*.pkl) found in {model_dir}")
+
+        # Pick the first (or only) match of each
+        final_model_path = os.path.join(model_dir, model_candidates[0])
+        final_metadata_path = os.path.join(model_dir, metadata_candidates[0])
+        final_baseline_path = os.path.join(model_dir, baseline_candidates[0])
+
+        check_paths_exist([final_model_path, final_metadata_path, final_baseline_path])
+
+        checkpoint = load_file(final_model_path, 'rb', lambda f: torch.load(f, map_location=device))
+        metadata = load_file(final_metadata_path, 'r', json.load)
+        baseline_data = load_file(final_baseline_path, 'rb', pickle.load)
+
+        model.model_recover(checkpoint['model'])
+
+        baseline_manager = BaselineCache()
+        baseline_manager.load_state_dict(checkpoint['baseline'])
+
+        baseline_explorer = explorer.HalfTimeExplorer(0.5, 0.2, 80)
+        baseline_explorer.count = checkpoint.get('baseline_count', 0)
+        total_training_time = metadata.get('total_training_time', 0.0)
+
+        if 'sample_weights' in checkpoint:
+            sample_weights = checkpoint['sample_weights']
+            log('Loaded sample weights')
+        else:
+            sample_weights = None
+
+        if 'train_rcs' in checkpoint:
+            train_rcs = checkpoint['train_rcs']
+            log('Loaded training RCS')
+        else:
+            train_rcs = None
+
+        if 'global_df' in checkpoint:
+            global_df = checkpoint['global_df']
+            log('Loaded global dataframe')
+        else:
+            global_df = None
+
+        if 'timer_df' in checkpoint:
+            timer_df = checkpoint['timer_df']
+            log('Loaded timer dataframe')
+        else:
+            timer_df = None
+
+        if 'timeout_limit' in checkpoint:
+            database.statement_timeout = checkpoint['timeout_limit']
+            log('Set statement timeout')
+
+        if 'random_state' in checkpoint:
+            set_random_state(checkpoint['random_state'])
+            log('Loaded random state')
+
+        if 'epoch' in checkpoint:
+            start_epoch = checkpoint['epoch'] + 1
+            model.schedule(start_epoch)
+            log(f'Resuming from epoch {start_epoch}')
+        else:
+            start_epoch = 0
 
     _total_train_timer = timer()
     use_beam = beam_width >= 1
@@ -489,6 +587,9 @@ def train(beam_width=1, epochs=400):
             _Time_search = 0.0
             _search_timer = timer()
             _Time_train_detail = [0.0, 0.0, 0.0, 0.0]
+            # Lists to store loss values for the current epoch
+            epoch_losses = []
+            epoch_use_gen_losses = []
 
             if epoch < 4:
                 bushy = False
@@ -606,6 +707,8 @@ def train(beam_width=1, epochs=400):
 
                     with _plan_timer:
                         loss, use_gen_loss, _Times = model.train(detail=True)
+                        epoch_losses.append(loss.item())
+                        epoch_use_gen_losses.append(use_gen_loss.item())                        
                         for i in range(len(_Times)):
                             _Time_train_detail[i] += _Times[i]
                         postfix.update(
@@ -679,9 +782,11 @@ def train(beam_width=1, epochs=400):
             else:
                 _Time_validate = None
 
-            timer_df.append((base_gmrl, len(baseline_manager.data), _Time_model, _Time_database, _Time_validate, _Time_plan, _Time_train, _Time_search, _Time_base, *_Time_train_detail))
+            avg_loss = np.mean(epoch_losses) if epoch_losses else 0.0
+            avg_use_gen_loss = np.mean(epoch_use_gen_losses) if epoch_use_gen_losses else 0.0
+            timer_df.append((base_gmrl, len(baseline_manager.data), _Time_model, _Time_database, _Time_validate, _Time_plan, _Time_train, _Time_search, _Time_base, avg_loss, avg_use_gen_loss, *_Time_train_detail))
             df = pd.DataFrame({k: v for k, v in zip((
-                'base_gmrl', 'base_len', 'time_model', 'time_database', 'time_validate', 'time_plan', 'time_train', 'time_search', 'time_base', 'time_train_batch_update', 'time_train_predict', 'time_train_train', 'time_train_use_generated',
+                'base_gmrl', 'base_len', 'time_model', 'time_database', 'time_validate', 'time_plan', 'time_train', 'time_search', 'time_base', 'avg_loss', 'avg_use_gen_loss', 'time_train_batch_update', 'time_train_predict', 'time_train_train', 'time_train_use_generated',
             ), zip(*timer_df))})
             df.to_csv(f'results/time.{FILE_ID}.csv', index=False)
 
@@ -710,7 +815,7 @@ def train(beam_width=1, epochs=400):
         save_training_artifacts(
             epoch, model, baseline_manager, baseline_explorer,
             sample_weights, train_rcs, database, global_df,
-            timer_df, total_training_time, random_state, args_dict
+            timer_df, total_training_time, random_state, args_dict, model_dir, avg_loss, avg_use_gen_loss
         )
         
     with open(f'baseline.pkl', 'wb') as f:
@@ -735,16 +840,37 @@ def train(beam_width=1, epochs=400):
     save_training_artifacts(
         epochs-1, model, baseline_manager, baseline_explorer,
         sample_weights, train_rcs, database, global_df,
-        timer_df, total_training_time, random_state, args_dict,
-        is_final=True
-    )
+        timer_df, total_training_time, random_state, args_dict, final_dir, avg_loss, avg_use_gen_loss,
+        is_final=True)
+
+import os
+from dotenv import load_dotenv
+
+def load_repo_env():
+    """Find and load the .env file from repo root."""
+    current_dir = os.path.abspath(os.path.dirname(__file__))
+    while True:
+        env_path = os.path.join(current_dir, ".env")
+        if os.path.exists(env_path):
+            load_dotenv(env_path)
+            break
+        parent_dir = os.path.dirname(current_dir)
+        if parent_dir == current_dir:
+            raise FileNotFoundError(".env file not found.")
+        current_dir = parent_dir
 
 if __name__ == '__main__':
     import argparse
-
+    load_repo_env()  # Load .env from repo root
     parser = argparse.ArgumentParser(add_help=False)
-    parser.add_argument('-d', '--dataset', nargs=2, type=str, default=['dataset/train', 'dataset/test'],
-                        help='Training and testing dataset.')
+    
+    # --- FEATURE UPDATE: Mutually exclusive group for dataset source ---
+    dataset_group = parser.add_mutually_exclusive_group(required=True)
+    dataset_group.add_argument('-d', '--dataset', nargs=2, type=str,
+                               help='Paths to pre-split training and testing dataset directories.')
+    dataset_group.add_argument('--split_source_dir', type=str,
+                               help='Path to a source directory to be split 80/20 into train/test sets.')
+
     parser.add_argument('-e', '--epochs', type=int, default=50,
                         help='Total epochs.')
     parser.add_argument('-F', '--id', type=str, default=FILE_ID,
@@ -779,16 +905,45 @@ if __name__ == '__main__':
                         help='Random seed.')
     parser.add_argument('-D', '--database', type=str, default='imdbload',
                         help='PostgreSQL database.')    
-    parser.add_argument('-U', '--user', type=str, default='suite_user',
-                        help='PostgreSQL user.')
-    parser.add_argument('-P', '--password', type=str, default='71Vgfi4mUNPm',
-                        help='PostgreSQL user password.')
-    parser.add_argument('--port', type=int, default=5469,
-                        help='PostgreSQL port.')
-    parser.add_argument('-H', '--host', type=str, default='train.darelab.athenarc.gr', 
-                        help='PostgreSQL host.')
+    
+    parser.add_argument('-U', '--user', default=os.getenv("DB_USER"), help='PostgreSQL user')
+    parser.add_argument('-P', '--password', default=os.getenv("DB_PASS"), help='PostgreSQL password')
+    parser.add_argument('-H', '--host', default=os.getenv("DB_HOST"), help='PostgreSQL host')
+
+    default_port = os.getenv("DB_PORT")  # may be None
+    db_port_map = {
+        "imdbload": os.getenv("IMDB_PORT"),
+        "tpch": os.getenv("TPCH_PORT"),
+        "tpcds": os.getenv("TPCDS_PORT"),
+        "ssb": os.getenv("SSB_PORT"),
+    }
+
+    # stack_* databases handled together
+    if not default_port:
+        if "stack" in os.getenv("DB_NAME", ""):
+            default_port = os.getenv("STACK_PORT", "5432")
+        else:
+            default_port = db_port_map.get(os.getenv("DB_NAME", ""), "5432")
+
+    parser.add_argument('--port', type=int, default=int(default_port or "5432"),
+                        help='Database port')
+
+    parser.add_argument('-o','--query_order', type=str,
+                        help='To use the query order file.')
+    parser.add_argument('--checkpoint_dir', type=str, default='checkpoints',
+                        help='Directory of model checkpoint to continue training.')
+    parser.add_argument('--target_checkpoint_dir', type=str, default='final_model', required=True,
+                        help='Directory to save the model checkpoints.')
 
     args = parser.parse_args()
+
+    if not os.getenv("DB_PORT"):  # only adjust if not globally defined
+        if args.database in db_port_map and db_port_map[args.database]:
+            args.port = int(db_port_map[args.database])
+        elif "stack" in args.database.lower():
+            args.port = int(os.getenv("STACK_PORT", "5432"))
+        else:
+            args.port = 5432
 
     args_dict = vars(args)
 
@@ -831,7 +986,7 @@ if __name__ == '__main__':
             database.assistant_setup(dbname=args.database, cache=False)
 
     database.config.bushy = args.bushy
-
+    
     dataset_file = f'temps/{FILE_ID}.dataset.pkl'
     if os.path.isfile(dataset_file):
         dataset = torch.load(dataset_file, map_location=device)
@@ -839,6 +994,30 @@ if __name__ == '__main__':
         for _set in (train_set, test_set):
             for sql in _set:
                 sql.to(device)
+    # --- FEATURE UPDATE: Logic to handle dataset creation ---
+    elif args.split_source_dir:
+        log(f"Loading files from '{args.split_source_dir}' to perform 80/20 split.")
+        
+        all_sql_files = _load(args.split_source_dir, verbose=True)
+        random.shuffle(all_sql_files)  # Shuffle for a random split
+        
+        split_point = int(len(all_sql_files) * 0.8)
+        train_files = all_sql_files[:split_point]
+        test_files = all_sql_files[split_point:]
+        
+        log(f"Split data into {len(train_files)} training and {len(test_files)} testing queries.")
+        
+        log('Generating train set from split')
+        train_set, _ = _parse_and_create_sql_objects_with_detail(
+            train_files, database.config, device, verbose=True
+        )
+        
+        log('Generating test set from split')
+        test_set, _ = _parse_and_create_sql_objects_with_detail(
+            test_files, database.config, device, verbose=True
+        )
+        
+        torch.save([train_set, test_set], dataset_file, _use_new_zipfile_serialization=False)
     else:
         train_path, test_path = args.dataset
 
@@ -849,6 +1028,20 @@ if __name__ == '__main__':
 
         torch.save([train_set, test_set], dataset_file, _use_new_zipfile_serialization=False)
 
+    if args.query_order:
+        train_order_file = args.query_order
+        if train_order_file and os.path.isfile(train_order_file):
+            with open(train_order_file, 'r') as f:
+                ordered_queries = [line.strip() for line in f if line.strip()]
+        
+        # Create a mapping from query to index for quick lookup
+        query_to_index = {query: idx for idx, query in enumerate(ordered_queries)}    
+        train_set = sorted(train_set, key=lambda x: query_to_index.get(x.filename, len(ordered_queries)))        
+    else:
+        # Randomly shuffle the train_set if no order is specified
+        import random
+        random.shuffle(train_set)
+
     if args.warm_up is not None:
         database_warmup(train_set, k=args.warm_up)
         seed(args.seed)
@@ -858,16 +1051,18 @@ if __name__ == '__main__':
     reward_weighting = args.weight
 
     model = DeepQNet(device=device, half=200, out_dim=args.switches, num_table_layers=args.layers,
-                     use_value_predict=False, restricted_operator=restricted_operator,
-                     reward_weighting=reward_weighting, log_cap=args.log_cap)
+                    use_value_predict=False, restricted_operator=restricted_operator,
+                    reward_weighting=reward_weighting, log_cap=args.log_cap)
 
-    pretrain_file = args.pretrain
-    if pretrain_file is not None and os.path.isfile(pretrain_file):
-        dic = torch.load(pretrain_file, map_location=device)
-        if 'use_gen' in dic:
-            del dic['use_gen']
-        model.model_recover(dic)
+    if not args.checkpoint_dir or not os.path.isdir(args.checkpoint_dir):
+
+        pretrain_file = args.pretrain
+        if pretrain_file is not None and os.path.isfile(pretrain_file):
+            dic = torch.load(pretrain_file, map_location=device)
+            if 'use_gen' in dic:
+                del dic['use_gen']
+            model.model_recover(dic)
 
     database.config.beam_width = args.beam
 
-    train(beam_width=args.beam, epochs=args.epochs)
+    train(beam_width=args.beam, epochs=args.epochs, args=args)

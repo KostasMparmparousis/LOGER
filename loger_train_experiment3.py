@@ -30,10 +30,6 @@ import shutil
 
 from core.oracle import oracle_database
 USE_ORACLE = False
-CHECKPOINT_DIR = "/data/hdd1/users/kmparmp/Learned-Optimizers-Benchmarking-Suite/models/experiment5/5.3/LOGER/stack_2015/checkpoints"
-CHECKPOINT_PATH = os.path.join(CHECKPOINT_DIR, "20250729_223436_epoch6_1.pkl")
-METADATA_PATH = os.path.join(CHECKPOINT_DIR, "20250729_223436_epoch6_1_metadata.json")
-BASELINE_PATH = os.path.join(CHECKPOINT_DIR, "20250729_223436_epoch6_1_baseline.pkl")
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 USE_LATENCY = True
@@ -310,44 +306,6 @@ def database_warmup(train_set, k=400):
         gen.set_postfix({'file': sql.filename})
         database.latency(str(sql), cache=False)
 
-def load_checkpoint():
-    for path in [CHECKPOINT_PATH, METADATA_PATH, BASELINE_PATH]:
-        if not os.path.exists(path):
-            raise FileNotFoundError(f"Checkpoint file {path} does not exist.")
-    
-    with open(CHECKPOINT_PATH, 'rb') as f:
-        checkpoint = torch.load(f, map_location=device)
-    
-    with open(METADATA_PATH, 'r') as f:
-        metadata = json.load(f)
-    
-    with open(BASELINE_PATH, 'rb') as f:
-        baseline_data = pickle.load(f)
-    
-    model = DeepQNet(
-        device=device,
-        half=200,
-        out_dim=4,
-        num_table_layers=1,
-        use_value_predict=False,
-        restricted_operator=True,
-        reward_weighting=0.1,
-        log_cap=1.0
-    )
-    model.model_recover(checkpoint['model'])
-
-    # Initialize baseline manager
-    baseline_manager = BaselineCache()
-    baseline_manager.data = baseline_data
-    
-    # Set additional properties from checkpoint
-    if 'baseline' in checkpoint:
-        baseline_manager.load_state_dict(checkpoint['baseline'])
-    if 'timeout_limit' in checkpoint:
-        database.statement_timeout = checkpoint['timeout_limit']
-
-    return model, baseline_manager, metadata
-
 def save_training_artifacts(epoch, model, baseline_manager, baseline_explorer, 
                            sample_weights, train_rcs, database, global_df, 
                            timer_df, total_time, random_state, args_dict, model_dir,
@@ -523,11 +481,31 @@ def train(beam_width=1, epochs=100, parent_dir='.', args=None):
             if missing:
                 raise FileNotFoundError(f"Missing required files: {', '.join(missing)}")
 
-        check_paths_exist([CHECKPOINT_PATH, METADATA_PATH, BASELINE_PATH])
+        model_dir = args.checkpoint_dir
+        files = os.listdir(model_dir)
 
-        checkpoint = load_file(CHECKPOINT_PATH, 'rb', lambda f: torch.load(f, map_location=device))
-        metadata = load_file(METADATA_PATH, 'r', json.load)
-        baseline_data = load_file(BASELINE_PATH, 'rb', pickle.load)
+        # Identify model, metadata, and baseline files by name pattern
+        model_candidates = [f for f in files if f.endswith(".pkl") and "baseline" not in f]
+        baseline_candidates = [f for f in files if f.endswith("_baseline.pkl")]
+        metadata_candidates = [f for f in files if f.endswith(".json")]
+
+        if not model_candidates:
+            raise FileNotFoundError(f"No model checkpoint (*.pkl) found in {model_dir}")
+        if not metadata_candidates:
+            raise FileNotFoundError(f"No metadata (*.json) found in {model_dir}")
+        if not baseline_candidates:
+            raise FileNotFoundError(f"No baseline (*.pkl) found in {model_dir}")
+
+        # Pick the first (or only) match of each
+        final_model_path = os.path.join(model_dir, model_candidates[0])
+        final_metadata_path = os.path.join(model_dir, metadata_candidates[0])
+        final_baseline_path = os.path.join(model_dir, baseline_candidates[0])
+
+        check_paths_exist([final_model_path, final_metadata_path, final_baseline_path])
+
+        checkpoint = load_file(final_model_path, 'rb', lambda f: torch.load(f, map_location=device))
+        metadata = load_file(final_metadata_path, 'r', json.load)
+        baseline_data = load_file(final_baseline_path, 'rb', pickle.load)
 
         model.model_recover(checkpoint['model'])
 
@@ -940,9 +918,26 @@ def train(beam_width=1, epochs=100, parent_dir='.', args=None):
         avg_loss, avg_use_gen_loss, total_queries_seen, is_final=True, checkpoint_reason="final"
     )
 
+import os
+from dotenv import load_dotenv
+
+def load_repo_env():
+    """Find and load the .env file from repo root."""
+    current_dir = os.path.abspath(os.path.dirname(__file__))
+    while True:
+        env_path = os.path.join(current_dir, ".env")
+        if os.path.exists(env_path):
+            load_dotenv(env_path)
+            break
+        parent_dir = os.path.dirname(current_dir)
+        if parent_dir == current_dir:
+            raise FileNotFoundError(".env file not found.")
+        current_dir = parent_dir
+
 if __name__ == '__main__':
     # Using add_help=False to add a custom help group later
     import argparse
+    load_repo_env()
     parser = argparse.ArgumentParser(description="Run standardized training for LOGER.", add_help=False)
 
     # --- Group 1: Required Paths & Core Settings ---
@@ -974,9 +969,10 @@ if __name__ == '__main__':
                            help='Save a checkpoint every N queries processed.')
     exp_group.add_argument('--loss_improvement_threshold', type=float, default=0.0001,
                            help='Save a checkpoint if model loss improves by at least this much.')
+    exp_group.add_argument('--checkpoint_dir', type=str, default='checkpoints',
+                           help='Directory with checkpoint to continue training.')
 
     # --- Group 3: LOGER-Specific Hyperparameters ---
-    # ... (This group remains unchanged) ...
     loger_group = parser.add_argument_group('LOGER Hyperparameters')
     loger_group.add_argument('-b', '--beam', type=int, default=4, help='Beam width. A beam width < 1 indicates simple epsilon-greedy policy.')
     loger_group.add_argument('-s', '--switches', type=int, default=4, help='Branch amount of join methods.')
@@ -985,13 +981,29 @@ if __name__ == '__main__':
     loger_group.add_argument('--log-cap', type=float, default=1.0, help='Cap of log transformation.')
 
     # --- Group 4: Database Connection ---
-    # ... (This group remains unchanged) ...
     db_group = parser.add_argument_group('Database Connection')
-    db_group.add_argument('-D', '--database', type=str, default='imdbload', help='PostgreSQL database.')    
-    db_group.add_argument('-U', '--user', type=str, default='suite_user', help='PostgreSQL user.')
-    db_group.add_argument('-P', '--password', type=str, default='71Vgfi4mUNPm', help='PostgreSQL user password.')
-    db_group.add_argument('--port', type=int, default=5469, help='PostgreSQL port.')
-    db_group.add_argument('-H', '--host', type=str, default='train.darelab.athenarc.gr', help='PostgreSQL host.')
+    db_group.add_argument('-D', '--database', type=str, default='imdbload', help='PostgreSQL database.')        
+    db_group.add_argument('-U', '--user', default=os.getenv("DB_USER"), help='PostgreSQL user')
+    db_group.add_argument('-P', '--password', default=os.getenv("DB_PASS"), help='PostgreSQL password')
+    db_group.add_argument('-H', '--host', default=os.getenv("DB_HOST"), help='PostgreSQL host')
+
+    default_port = os.getenv("DB_PORT")  # may be None
+    db_port_map = {
+        "imdbload": os.getenv("IMDB_PORT"),
+        "tpch": os.getenv("TPCH_PORT"),
+        "tpcds": os.getenv("TPCDS_PORT"),
+        "ssb": os.getenv("SSB_PORT"),
+    }
+
+    # stack_* databases handled together
+    if not default_port:
+        if "stack" in os.getenv("DB_NAME", ""):
+            default_port = os.getenv("STACK_PORT", "5432")
+        else:
+            default_port = db_port_map.get(os.getenv("DB_NAME", ""), "5432")
+
+    db_group.add_argument('--port', type=int, default=int(default_port or "5432"),
+                        help='Database port')
     db_group.add_argument('--oracle', type=str, default=None, help='To use oracle with given connection settings.')
 
     # --- Group 5: Advanced & Optional Settings ---
@@ -1012,6 +1024,14 @@ if __name__ == '__main__':
     optional_group.add_argument('-h', '--help', action='help', help='show this help message and exit')
 
     args = parser.parse_args()
+    if not os.getenv("DB_PORT"):  # only adjust if not globally defined
+        if args.database in db_port_map and db_port_map[args.database]:
+            args.port = int(db_port_map[args.database])
+        elif "stack" in args.database.lower():
+            args.port = int(os.getenv("STACK_PORT", "5432"))
+        else:
+            args.port = 5432
+    
     args_dict = vars(args)
 
     FILE_ID = args.id

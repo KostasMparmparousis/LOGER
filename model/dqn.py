@@ -271,6 +271,8 @@ class DeepQNet:
                 Plan.MERGE_JOIN if join == 2 else \
                 Plan.NEST_LOOP_JOIN
         # join_method = Plan.NEST_LOOP_JOIN
+        # join_method = Plan.MERGE_JOIN
+        # join_method = Plan.HASH_JOIN
         parent_alias = state.join(left_alias, right_alias, join_method=join_method)
 
         left_emb, right_emb = state.root_node_emb(left_alias), state.root_node_emb(right_alias)

@@ -17,11 +17,6 @@ import time
 from lib.randomize import seed, get_random_state, set_random_state
 
 # Configuration - Updated with your paths
-MODEL_DIR = "/data/hdd1/users/kmparmp/Learned-Optimizers-Benchmarking-Suite/models/experiment5/5.3/LOGER/stack_2011/checkpoints"
-FINAL_MODEL_PATH = os.path.join(MODEL_DIR, "20250818_062634_epoch25_1.pkl")
-FINAL_METADATA_PATH = os.path.join(MODEL_DIR, "20250818_062634_epoch25_1_metadata.json")
-FINAL_BASELINE_PATH = os.path.join(MODEL_DIR, "20250818_062634_epoch25_1_baseline.pkl")
-RESULTS_DIR = "/data/hdd1/users/kmparmp/Learned-Optimizers-Benchmarking-Suite/optimizers/LOGER/results"
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 USE_ORACLE = False
 USE_LATENCY = True
@@ -210,23 +205,48 @@ class BaselineCache:
             return res[0]
         return None
 
-def load_model_and_artifacts():
-    """Load the trained model and all artifacts from specified paths"""
-    # Verify all required files exist
-    for path in [FINAL_MODEL_PATH, FINAL_METADATA_PATH, FINAL_BASELINE_PATH]:
-        if not os.path.exists(path):
-            raise FileNotFoundError(f"Required file not found: {path}")
-    
+def load_model_and_artifacts(model_dir):
+    """
+    Load the trained LOGER model and associated artifacts from the given directory.
+    Expects three files:
+        - *model*.pkl        → the main model checkpoint
+        - *metadata*.json    → metadata file
+        - *baseline*.pkl     → baseline cache file
+    """
+    # List all files in the directory
+    files = os.listdir(model_dir)
+
+    # Identify model, metadata, and baseline files by name pattern
+    model_candidates = [f for f in files if f.endswith(".pkl") and "baseline" not in f]
+    baseline_candidates = [f for f in files if f.endswith("_baseline.pkl")]
+    metadata_candidates = [f for f in files if f.endswith("_metadata.json")]
+
+    if not model_candidates:
+        raise FileNotFoundError(f"No model checkpoint (*.pkl) found in {model_dir}")
+    if not metadata_candidates:
+        raise FileNotFoundError(f"No metadata (*.json) found in {model_dir}")
+    if not baseline_candidates:
+        raise FileNotFoundError(f"No baseline (*.pkl) found in {model_dir}")
+
+    # Pick the first (or only) match of each
+    final_model_path = os.path.join(model_dir, model_candidates[0])
+    final_metadata_path = os.path.join(model_dir, metadata_candidates[0])
+    final_baseline_path = os.path.join(model_dir, baseline_candidates[0])
+
+    print(f"→ Loading model from: {final_model_path}")
+    print(f"→ Loading metadata from: {final_metadata_path}")
+    print(f"→ Loading baseline from: {final_baseline_path}")
+
     # Load metadata
-    with open(FINAL_METADATA_PATH) as f:
+    with open(final_metadata_path) as f:
         metadata = json.load(f)
-    
+
     # Load baseline data
-    with open(FINAL_BASELINE_PATH, 'rb') as f:
+    with open(final_baseline_path, "rb") as f:
         baseline_data = pickle.load(f)
-    
+
     # Load model checkpoint
-    checkpoint = torch.load(FINAL_MODEL_PATH, map_location=DEVICE)
+    checkpoint = torch.load(final_model_path, map_location=DEVICE)
     
     # Initialize model
     model = DeepQNet(
@@ -250,9 +270,7 @@ def load_model_and_artifacts():
         baseline_manager.load_state_dict(checkpoint['baseline'])
     if 'timeout_limit' in checkpoint:
         database.statement_timeout = checkpoint['timeout_limit']
-    # Set query timeout to 10 minutes
-    database.statement_timeout = 600000
-    print("Set database statement timeout to 600000 ms")
+    
     print(database.statement_timeout)
     model.eval_mode()
     return model, baseline_manager, metadata
@@ -555,6 +573,22 @@ def save_results(results, average_q_error, output_file):
     with open(output_file, 'a') as f:
         f.write(f'\nAverage Q-error: {average_q_error}')
 
+import os
+from dotenv import load_dotenv
+
+def load_repo_env():
+    """Find and load the .env file from repo root."""
+    current_dir = os.path.abspath(os.path.dirname(__file__))
+    while True:
+        env_path = os.path.join(current_dir, ".env")
+        if os.path.exists(env_path):
+            load_dotenv(env_path)
+            break
+        parent_dir = os.path.dirname(current_dir)
+        if parent_dir == current_dir:
+            raise FileNotFoundError(".env file not found.")
+        current_dir = parent_dir
+
 if __name__ == '__main__':
     import argparse
 
@@ -564,22 +598,48 @@ if __name__ == '__main__':
                        help='Output CSV file path')
     parser.add_argument('--verbose', action='store_true', help='Verbose output')
     parser.add_argument('-D', '--database', default='imdbload', help='Database name')
-    parser.add_argument('-U', '--user', default='suite_user', help='Database user')
-    parser.add_argument('-P', '--password', default='71Vgfi4mUNPm', help='Database password')
-    parser.add_argument('--host', default='train.darelab.athenarc.gr', help='Database host')
-    parser.add_argument('--port', type=int, default=5469, help='Database port')
+    parser.add_argument('-U', '--user', default=os.getenv("DB_USER"), help='Database user')
+    parser.add_argument('-P', '--password', default=os.getenv("DB_PASS"), help='Database password')
+    parser.add_argument('--host', default=os.getenv("DB_HOST"), help='Database host')
+
+    default_port = os.getenv("DB_PORT")  # may be None
+    db_port_map = {
+        "imdbload": os.getenv("IMDB_PORT"),
+        "tpch": os.getenv("TPCH_PORT"),
+        "tpcds": os.getenv("TPCDS_PORT"),
+        "ssb": os.getenv("SSB_PORT"),
+    }
+
+    # stack_* databases handled together
+    if not default_port:
+        if "stack" in os.getenv("DB_NAME", ""):
+            default_port = os.getenv("STACK_PORT", "5432")
+        else:
+            default_port = db_port_map.get(os.getenv("DB_NAME", ""), "5432")
+
+    parser.add_argument('--port', type=int, default=int(default_port or "5432"),
+                        help='Database port')
     parser.add_argument('--skip_loger_processed', action='store_true',
                         help='Skip already processed LOGER queries')
     parser.add_argument('--base_year', type=int, default=2011, help='Base year for query generation')
     parser.add_argument('--tested_year', type=int, default=2011, help='End year for query generation')
+    parser.add_argument('--checkpoint_dir', type=str, default='checkpoints',
+                        help='Directory to save model checkpoints')    
     args = parser.parse_args()
+    if not os.getenv("DB_PORT"):  # only adjust if not globally defined
+        if args.database in db_port_map and db_port_map[args.database]:
+            args.port = int(db_port_map[args.database])
+        elif "stack" in args.database.lower():
+            args.port = int(os.getenv("STACK_PORT", "5432"))
+        else:
+            args.port = 5432    
     skip_loger_processed = args.skip_loger_processed
     # Initialize database
     initialize_db(args)
 
     # Load model and artifacts
     try:
-        model, baseline_manager, metadata = load_model_and_artifacts()
+        model, baseline_manager, metadata = load_model_and_artifacts(args.checkpoint_dir)
         log("Successfully loaded model and artifacts")
     except Exception as e:
         log(f"Failed to load model: {e}")
