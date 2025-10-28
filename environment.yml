@@ -134,6 +134,8 @@ dependencies:
   - pip:
       - cx-oracle==8.3.0
       - cython==3.0.11
+      - dotenv==0.9.9
+      - pathlib==1.0.1
       - psqlparse==1.0rc7
+      - python-dotenv==1.0.1
       - six==1.17.0
-prefix: /data/hdd1/users/kmparmp/miniconda3/envs/loger
